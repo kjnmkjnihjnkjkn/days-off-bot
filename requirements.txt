@@ -1,4 +1,4 @@
 aiogram==3.4.1
-psycopg[binary]==3.1.18
-psycopg-pool==3.2.0
+psycopg[binary]
+psycopg-pool
 APScheduler==3.10.4
