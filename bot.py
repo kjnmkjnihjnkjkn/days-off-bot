@@ -1,6 +1,6 @@
 """
 🤖 Telegram-бот «Выходные сотрудников»
-Оптимизированная версия для деплоя на Render
+Версия с SQLite (не требует PostgreSQL)
 """
 
 import asyncio
@@ -9,6 +9,8 @@ import os
 from datetime import datetime, timedelta
 from typing import List, Optional
 import random
+import json
+import aiosqlite
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command, CommandStart
@@ -20,20 +22,16 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-import asyncpg
-from asyncpg import Pool
-
 # ============================================================================
-# КОНФИГУРАЦИЯ (берётся из переменных окружения)
+# КОНФИГУРАЦИЯ
 # ============================================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_PATH = os.getenv("DATABASE_PATH", "/opt/render/project/data/bot.db")
 ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = [int(id.strip()) for id in ADMIN_IDS_STR.split(",") if id.strip()]
 
 DEADLINE_HOUR = int(os.getenv("DEADLINE_HOUR", "18"))
-MAX_WORKERS_PER_DAY = None  # Без лимита
 AUTO_ASSIGN_ENABLED = os.getenv("AUTO_ASSIGN", "true").lower() == "true"
 
 DAYS = {
@@ -59,19 +57,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# БАЗА ДАННЫХ
+# БАЗА ДАННЫХ SQLite
 # ============================================================================
 
 class Database:
-    def __init__(self, pool: Pool):
-        self.pool = pool
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    
+    async def get_connection(self):
+        return await aiosqlite.connect(self.db_path)
     
     async def init_tables(self):
         """Создание таблиц БД"""
-        async with self.pool.acquire() as conn:
-            await conn.execute("""
+        async with await self.get_connection() as db:
+            await db.execute("""
                 CREATE TABLE IF NOT EXISTS users (
-                    id BIGINT PRIMARY KEY,
+                    id INTEGER PRIMARY KEY,
                     name TEXT NOT NULL,
                     username TEXT,
                     role TEXT NOT NULL DEFAULT 'worker',
@@ -79,9 +81,9 @@ class Database:
                 )
             """)
             
-            await conn.execute("""
+            await db.execute("""
                 CREATE TABLE IF NOT EXISTS weeks (
-                    id SERIAL PRIMARY KEY,
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
                     week_start_date DATE NOT NULL,
                     week_end_date DATE NOT NULL,
                     deadline_datetime TIMESTAMP NOT NULL,
@@ -89,56 +91,70 @@ class Database:
                 )
             """)
             
-            await conn.execute("""
+            await db.execute("""
                 CREATE TABLE IF NOT EXISTS day_off_requests (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT NOT NULL REFERENCES users(id),
-                    week_id INTEGER NOT NULL REFERENCES weeks(id),
-                    days_off TEXT[] NOT NULL,
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    week_id INTEGER NOT NULL,
+                    days_off TEXT NOT NULL,
                     confirmed_at TIMESTAMP,
                     status TEXT NOT NULL DEFAULT 'pending',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(user_id, week_id)
+                    UNIQUE(user_id, week_id),
+                    FOREIGN KEY (user_id) REFERENCES users(id),
+                    FOREIGN KEY (week_id) REFERENCES weeks(id)
                 )
             """)
             
-            await conn.execute("""
+            await db.execute("""
                 CREATE TABLE IF NOT EXISTS violations_stats (
-                    user_id BIGINT PRIMARY KEY REFERENCES users(id),
+                    user_id INTEGER PRIMARY KEY,
                     late_count INTEGER DEFAULT 0,
                     missed_count INTEGER DEFAULT 0,
-                    auto_assigned_count INTEGER DEFAULT 0
+                    auto_assigned_count INTEGER DEFAULT 0,
+                    FOREIGN KEY (user_id) REFERENCES users(id)
                 )
             """)
+            
+            await db.commit()
     
     async def get_or_create_user(self, user_id: int, name: str, username: str = None) -> dict:
         """Получить или создать пользователя"""
-        async with self.pool.acquire() as conn:
-            user = await conn.fetchrow(
-                "SELECT * FROM users WHERE id = $1", user_id
-            )
+        async with await self.get_connection() as db:
+            async with db.execute("SELECT * FROM users WHERE id = ?", (user_id,)) as cursor:
+                user = await cursor.fetchone()
+            
             if not user:
-                await conn.execute(
-                    "INSERT INTO users (id, name, username, role) VALUES ($1, $2, $3, 'worker')",
-                    user_id, name, username
+                await db.execute(
+                    "INSERT INTO users (id, name, username, role) VALUES (?, ?, ?, 'worker')",
+                    (user_id, name, username)
                 )
-                await conn.execute(
-                    "INSERT INTO violations_stats (user_id) VALUES ($1)",
-                    user_id
+                await db.execute(
+                    "INSERT INTO violations_stats (user_id) VALUES (?)",
+                    (user_id,)
                 )
-                user = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
-            return dict(user)
+                await db.commit()
+                
+                async with db.execute("SELECT * FROM users WHERE id = ?", (user_id,)) as cursor:
+                    user = await cursor.fetchone()
+            
+            columns = [desc[0] for desc in cursor.description]
+            return dict(zip(columns, user))
     
     async def get_current_week(self) -> Optional[dict]:
         """Получить текущую неделю"""
-        async with self.pool.acquire() as conn:
-            week = await conn.fetchrow("""
+        async with await self.get_connection() as db:
+            async with db.execute("""
                 SELECT * FROM weeks 
-                WHERE week_start_date <= CURRENT_DATE 
-                AND week_end_date >= CURRENT_DATE
+                WHERE date(week_start_date) <= date('now') 
+                AND date(week_end_date) >= date('now')
                 ORDER BY week_start_date DESC LIMIT 1
-            """)
-            return dict(week) if week else None
+            """) as cursor:
+                week = await cursor.fetchone()
+                if not week:
+                    return None
+                columns = [desc[0] for desc in cursor.description]
+                return dict(zip(columns, week))
     
     async def create_new_week(self):
         """Создать новую неделю"""
@@ -151,87 +167,120 @@ class Database:
         week_end = week_start + timedelta(days=6)
         deadline = datetime.combine(week_start - timedelta(days=1), datetime.min.time()).replace(hour=DEADLINE_HOUR)
         
-        async with self.pool.acquire() as conn:
-            week_id = await conn.fetchval("""
+        async with await self.get_connection() as db:
+            cursor = await db.execute("""
                 INSERT INTO weeks (week_start_date, week_end_date, deadline_datetime)
-                VALUES ($1, $2, $3)
-                RETURNING id
-            """, week_start, week_end, deadline)
+                VALUES (?, ?, ?)
+            """, (week_start, week_end, deadline))
+            await db.commit()
+            week_id = cursor.lastrowid
             
         logger.info(f"Создана новая неделя {week_id}: {week_start} - {week_end}")
         return week_id
     
     async def get_user_request(self, user_id: int, week_id: int) -> Optional[dict]:
         """Получить запрос пользователя на неделю"""
-        async with self.pool.acquire() as conn:
-            req = await conn.fetchrow("""
+        async with await self.get_connection() as db:
+            async with db.execute("""
                 SELECT * FROM day_off_requests 
-                WHERE user_id = $1 AND week_id = $2
-            """, user_id, week_id)
-            return dict(req) if req else None
+                WHERE user_id = ? AND week_id = ?
+            """, (user_id, week_id)) as cursor:
+                req = await cursor.fetchone()
+                if not req:
+                    return None
+                columns = [desc[0] for desc in cursor.description]
+                result = dict(zip(columns, req))
+                result['days_off'] = json.loads(result['days_off'])
+                return result
     
     async def save_days_off(self, user_id: int, week_id: int, days: List[str], status: str = 'pending'):
         """Сохранить выбор дней"""
-        async with self.pool.acquire() as conn:
-            await conn.execute("""
+        days_json = json.dumps(days)
+        async with await self.get_connection() as db:
+            await db.execute("""
                 INSERT INTO day_off_requests (user_id, week_id, days_off, status)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (user_id, week_id) 
-                DO UPDATE SET days_off = $3, status = $4
-            """, user_id, week_id, days, status)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id, week_id) 
+                DO UPDATE SET days_off = ?, status = ?
+            """, (user_id, week_id, days_json, status, days_json, status))
+            await db.commit()
     
     async def confirm_days_off(self, user_id: int, week_id: int, is_late: bool = False):
         """Подтвердить выбор"""
         status = 'late' if is_late else 'ok'
-        async with self.pool.acquire() as conn:
-            await conn.execute("""
+        async with await self.get_connection() as db:
+            await db.execute("""
                 UPDATE day_off_requests 
-                SET confirmed_at = CURRENT_TIMESTAMP, status = $3
-                WHERE user_id = $1 AND week_id = $2
-            """, user_id, week_id, status)
+                SET confirmed_at = CURRENT_TIMESTAMP, status = ?
+                WHERE user_id = ? AND week_id = ?
+            """, (status, user_id, week_id))
             
             if is_late:
-                await conn.execute("""
+                await db.execute("""
                     UPDATE violations_stats 
                     SET late_count = late_count + 1
-                    WHERE user_id = $1
-                """, user_id)
+                    WHERE user_id = ?
+                """, (user_id,))
+            
+            await db.commit()
     
     async def get_week_status(self, week_id: int) -> List[dict]:
         """Получить статус всех работников на неделю"""
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch("""
+        async with await self.get_connection() as db:
+            async with db.execute("""
                 SELECT u.id, u.name, u.username, d.days_off, d.confirmed_at, d.status
                 FROM users u
-                LEFT JOIN day_off_requests d ON u.id = d.user_id AND d.week_id = $1
+                LEFT JOIN day_off_requests d ON u.id = d.user_id AND d.week_id = ?
                 WHERE u.role = 'worker'
                 ORDER BY u.name
-            """, week_id)
-            return [dict(row) for row in rows]
+            """, (week_id,)) as cursor:
+                rows = await cursor.fetchall()
+                columns = [desc[0] for desc in cursor.description]
+                result = []
+                for row in rows:
+                    data = dict(zip(columns, row))
+                    if data['days_off']:
+                        data['days_off'] = json.loads(data['days_off'])
+                    result.append(data)
+                return result
     
     async def get_user_stats(self, user_id: int) -> dict:
         """Получить статистику пользователя"""
-        async with self.pool.acquire() as conn:
-            stats = await conn.fetchrow(
-                "SELECT * FROM violations_stats WHERE user_id = $1", user_id
-            )
-            return dict(stats) if stats else {}
+        async with await self.get_connection() as db:
+            async with db.execute(
+                "SELECT * FROM violations_stats WHERE user_id = ?", (user_id,)
+            ) as cursor:
+                stats = await cursor.fetchone()
+                if not stats:
+                    return {}
+                columns = [desc[0] for desc in cursor.description]
+                return dict(zip(columns, stats))
     
     async def auto_assign_days(self, user_id: int, week_id: int):
         """Автоназначение выходных"""
         days = ["sun", "mon"]
-        async with self.pool.acquire() as conn:
-            await conn.execute("""
+        days_json = json.dumps(days)
+        async with await self.get_connection() as db:
+            await db.execute("""
                 INSERT INTO day_off_requests (user_id, week_id, days_off, confirmed_at, status)
-                VALUES ($1, $2, $3, CURRENT_TIMESTAMP, 'auto')
-                ON CONFLICT (user_id, week_id) DO NOTHING
-            """, user_id, week_id, days)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP, 'auto')
+                ON CONFLICT(user_id, week_id) DO NOTHING
+            """, (user_id, week_id, days_json))
             
-            await conn.execute("""
+            await db.execute("""
                 UPDATE violations_stats 
                 SET missed_count = missed_count + 1, auto_assigned_count = auto_assigned_count + 1
-                WHERE user_id = $1
-            """, user_id)
+                WHERE user_id = ?
+            """, (user_id,))
+            
+            await db.commit()
+    
+    async def get_all_workers(self) -> List[dict]:
+        """Получить всех работников"""
+        async with await self.get_connection() as db:
+            async with db.execute("SELECT id FROM users WHERE role = 'worker'") as cursor:
+                rows = await cursor.fetchall()
+                return [{"id": row[0]} for row in rows]
 
 # ============================================================================
 # FSM СОСТОЯНИЯ
@@ -324,7 +373,7 @@ async def cmd_select(message: Message, state: FSMContext):
         week = await db.get_current_week()
     
     now = datetime.now()
-    deadline = week['deadline_datetime']
+    deadline = datetime.fromisoformat(week['deadline_datetime'])
     
     if now > deadline:
         await message.answer("⚠️ Дедлайн истёк! Обратись к администратору.")
@@ -398,7 +447,8 @@ async def confirm_selection(callback: CallbackQuery, state: FSMContext):
         return
     
     week = await db.get_current_week()
-    is_late = datetime.now() > week['deadline_datetime']
+    deadline = datetime.fromisoformat(week['deadline_datetime'])
+    is_late = datetime.now() > deadline
     
     await db.confirm_days_off(callback.from_user.id, week_id, is_late)
     await state.clear()
@@ -448,7 +498,7 @@ async def cmd_status(message: Message):
     for user in status:
         if user['confirmed_at']:
             days = ", ".join([DAYS[d] for d in user['days_off']])
-            time = user['confirmed_at'].strftime('%H:%M')
+            time = datetime.fromisoformat(user['confirmed_at']).strftime('%H:%M')
             
             if user['status'] == 'late':
                 emoji = "⚠️"
@@ -528,18 +578,17 @@ async def create_new_week_job():
     logger.info("Создание новой недели...")
     await db.create_new_week()
     
-    async with db.pool.acquire() as conn:
-        workers = await conn.fetch("SELECT id FROM users WHERE role = 'worker'")
-        
-        for worker in workers:
-            try:
-                await bot.send_message(
-                    worker['id'],
-                    "📅 Новая неделя началась! Не забудь выбрать 2 выходных дня.\n"
-                    "Используй /select"
-                )
-            except Exception as e:
-                logger.error(f"Не удалось отправить уведомление {worker['id']}: {e}")
+    workers = await db.get_all_workers()
+    
+    for worker in workers:
+        try:
+            await bot.send_message(
+                worker['id'],
+                "📅 Новая неделя началась! Не забудь выбрать 2 выходных дня.\n"
+                "Используй /select"
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отправить уведомление {worker['id']}: {e}")
 
 
 async def check_deadline_job():
@@ -589,11 +638,8 @@ async def main():
     
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN не установлен!")
-    if not DATABASE_URL:
-        raise ValueError("DATABASE_URL не установлен!")
     
-    pool = await asyncpg.create_pool(DATABASE_URL)
-    db = Database(pool)
+    db = Database(DATABASE_PATH)
     await db.init_tables()
     
     week = await db.get_current_week()
