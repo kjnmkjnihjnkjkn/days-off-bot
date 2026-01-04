@@ -1,3 +1,4 @@
 aiogram==3.4.1
 aiosqlite==0.20.0
 APScheduler==3.10.4
+pydantic==2.5.3
